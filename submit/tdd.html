@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TDD — Liveselling Copilot</title>
+  <link rel="stylesheet" href="_shared.css" />
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({ startOnLoad: true, securityLevel: "loose", theme: "default" });</script>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Liveselling Copilot — TDD</h1>
+<p class="subtitle">Technical design · v0.1 prototype · May 2026</p>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#arch">1. System architecture</a></li>
+    <li><a href="#ingest">2. Real-time ingestion</a></li>
+    <li><a href="#retrieval">3. Catalog grounding &amp; retrieval</a></li>
+    <li><a href="#tools">4. Tool layer &amp; function calling</a></li>
+    <li><a href="#guardrails">5. Guardrail stack</a></li>
+    <li><a href="#audit">6. Audit trail &amp; rollback</a></li>
+    <li><a href="#latency">7. Latency budget</a></li>
+    <li><a href="#ebay">8. eBay API integration</a></li>
+    <li><a href="#failure">9. Failure modes &amp; recovery</a></li>
+    <li><a href="#limits">10. Known limits &amp; next steps</a></li>
+  </ul>
+</nav>
+
+<h2 id="arch">1. System architecture</h2>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  Replayer["Chat replayer<br/>(mock buyer producer)"]
+  Browser["Operator console<br/>React + Vite"]
+  Replayer -- WS buyer_message --> Gateway
+  Browser  <-- WS events       --> Gateway
+  Gateway["FastAPI gateway<br/>/ws/chat /api/*"] --> Orchestrator
+  Orchestrator["Tool-use orchestrator<br/>(Anthropic Sonnet)"] --> Retriever
+  Retriever["Hybrid retriever<br/>BM25 + Chroma"] --> Catalog[("SQLite<br/>listings · audit · messages")]
+  Retriever --> Policies[("Policy MD chunks<br/>+ Chroma index")]
+  Orchestrator --> Tools["Tool layer<br/>get_listing · check_inventory ·<br/>search_catalog · search_policies ·<br/>apply_markdown · adjust_stock ·<br/>swap_listing · send_reply"]
+  Tools --> Guardrails["Guardrail stack<br/>price · stock · policy · tone · grounding"]
+  Guardrails --> Tools
+  Tools --> Audit[("audit_log<br/>append-only")]
+</pre>
+</div>
+
+<p>
+Three processes: the FastAPI backend, the Vite frontend dev server, and the chat replayer.
+Everything else (catalog DB, vector index, policy chunks, audit log) is local files.
+</p>
+
+<h2 id="ingest">2. Real-time ingestion</h2>
+
+<h3>2.1 Transport</h3>
+<p>
+Buyer messages enter via <code>WS /ws/chat?session_id=…&amp;role=producer</code>. The operator console
+opens a separate WebSocket on the same path with <code>role=operator</code> and receives all events
+for that session via a per-session pub/sub hub.
+</p>
+
+<h3>2.2 Event protocol (server → client)</h3>
+<table>
+<thead><tr><th>type</th><th>payload</th><th>purpose</th></tr></thead>
+<tbody>
+<tr><td><code>buyer_message</code></td><td><code>{text, buyer_handle}</code></td><td>echo of incoming message</td></tr>
+<tr><td><code>tool_use</code></td><td><code>{name, input}</code></td><td>shows what tool the LLM is invoking</td></tr>
+<tr><td><code>tool_result</code></td><td><code>{name, result}</code></td><td>tool's structured output</td></tr>
+<tr><td><code>token</code></td><td><code>{text}</code></td><td>streaming reply tokens</td></tr>
+<tr><td><code>first_token_ms</code></td><td><code>{ms}</code></td><td>latency telemetry</td></tr>
+<tr><td><code>reply</code></td><td><code>{payload: ReplyPayload}</code></td><td>final send_reply result + guardrail verdict</td></tr>
+<tr><td><code>latency</code></td><td><code>{first_token_ms, total_ms}</code></td><td>turn-end summary</td></tr>
+<tr><td><code>error</code></td><td><code>{detail}</code></td><td>orchestrator failure</td></tr>
+</tbody>
+</table>
+
+<h3>2.3 Backpressure &amp; concurrency</h3>
+<ul>
+  <li>Per session, orchestrator turns are run as <code>asyncio.create_task</code> — multiple buyer messages can be in-flight.</li>
+  <li>Per <em>buyer</em> we serialize using <code>asyncio.Lock</code> (planned; v0.1 fires-and-forgets) so two messages from the same buyer can't write conflicting tool calls.</li>
+  <li>Hub broadcast tolerates dead sockets and prunes them on next send.</li>
+</ul>
+
+<h2 id="retrieval">3. Catalog grounding &amp; retrieval</h2>
+
+<h3>3.1 Source of truth</h3>
+<ul>
+  <li><code>ebay-sample-data.csv</code> — 17,577 real eBay listings.</li>
+  <li>Filtered (no broken links, not discontinued, price &gt; $1) → 16,392.</li>
+  <li>Sampled to 800 (95% in-stock + 5% out-of-stock) for the demo, biased toward popular brands.</li>
+  <li>Synthesized fields the source CSV lacks: <code>stock_qty</code> (1–50), <code>cost</code> (55–75% of price), <code>margin_floor_pct</code> (8–18% by category).</li>
+</ul>
+
+<h3>3.2 Multipath pipeline (4 steps)</h3>
+<p>
+The brief asked for "retrieval and function calling" as a depth area. Rather
+than a single hybrid query, the retriever decomposes the buyer message into
+structured aspects, runs one path per aspect, fuses ranks, and judges the top
+hit before returning.
+</p>
+
+<table>
+<thead><tr><th>Step</th><th>Implementation</th><th>Output</th></tr></thead>
+<tbody>
+<tr><td><strong>1. Intent extraction</strong> (<code>retrieval/intent.py</code>)</td><td>Haiku with strict-JSON output (preferred) or deterministic regex fallback. Stopwords cover interrogatives + filler so they don't pollute downstream BM25.</td><td>9 aspects: <code>intention</code>, <code>product_name</code>, <code>manufacturer</code>, <code>category</code>, <code>price_target</code>, <code>price_max</code>, <code>quantity_required</code>, <code>color</code>, <code>memory</code>.</td></tr>
+<tr><td><strong>2. Per-aspect paths</strong> (<code>retrieval/multipath.py</code>)</td><td>One path per active aspect:<br/>
+  • <code>product_name_keyword</code> — BM25 over title + model + variants<br/>
+  • <code>product_name_vector</code> — Chroma + all-MiniLM-L6-v2<br/>
+  • <code>manufacturer_filter</code> — SQL filter, in-stock first<br/>
+  • <code>category_filter</code> — SQL filter<br/>
+  • <code>price_window</code> — SQL range, ±20% of target or under explicit max<br/>
+  • <code>memory_filter</code> — SQL on internal_memory<br/>
+  • <code>color_filter</code> — SQL on color_category<br/>
+  • <code>raw_hybrid</code> — fallback when no aspects extracted</td><td>Each path keeps top 10 unique listings.</td></tr>
+<tr><td><strong>3. RRF rerank</strong></td><td>Reciprocal Rank Fusion with <em>k = 60</em>. Each listing's <code>matched_paths</code> set is preserved.</td><td>Top 3 ranked hits with <code>rrf_score</code> + <code>matched_paths</code>.</td></tr>
+<tr><td><strong>4. Judge</strong></td><td>For each hit, check hard constraints from intent (manufacturer, category, stock-vs-quantity, price-vs-max, memory) <em>plus</em> a <strong>title-token relevance</strong> check: at least one ≥4-char content token from <code>product_name</code> must appear in the title. If not, miss reason <code>title_lacks:airpods,charging,case</code>.</td><td><code>top1_meets_requirements</code> (bool), <code>alternatives_offered</code> (bool), <code>judge_note</code> (string).</td></tr>
+</tbody>
+</table>
+
+<div class="callout good">
+<strong>Why title-token relevance matters:</strong> without it, a category-filter
+or manufacturer-filter alone could promote items to top-1 that contain none of
+the buyer's product noun. Real example caught during build: query "iPhone 14"
+matched a generic wrist-watch band on the digit "14"; the title-token check
+flagged it and the actual iPhone got promoted from hits[1] to the suggested reply.
+</div>
+
+<h3>3.3 BM25-only fallback</h3>
+<p>
+If Chroma isn't available (no <code>chromadb</code> installed locally), the
+multipath retriever drops the vector path and runs the rest. The system never
+silently fails — every retrieval call returns at least the keyword and filter
+signals. Policy retrieval falls back to keyword overlap with topic-targeted
+queries (<code>"shipping delivery times standard expedited carrier"</code> for
+shipping, etc.) so the right policy doc is returned even without embeddings.
+</p>
+
+<h3>3.4 Policy retrieval</h3>
+<p>
+Policies (<code>returns</code>, <code>shipping</code>, <code>authenticity</code>, <code>prohibited_claims</code>)
+are chunked at paragraph boundaries (~500 chars) and indexed in a separate Chroma collection.
+Returned chunks carry their policy name so <code>send_reply</code> can cite
+<code>[policy:returns]</code>. The orchestrator passes a topic-targeted retrieval
+query (not the buyer's verbatim message) to avoid keyword-overlap false-positives
+on the internal <code>prohibited_claims</code> doc.
+</p>
+
+<h2 id="tools">4. Tool layer &amp; function calling</h2>
+<p>The model sees these tools with strict JSON schemas. Reads have no side-effects; writes pass through guardrails and produce an <code>audit_id</code>.</p>
+
+<table>
+<thead><tr><th>Tool</th><th>Read/Write</th><th>Guardrails</th><th>Reversible?</th></tr></thead>
+<tbody>
+<tr><td><code>search_catalog</code></td><td>R</td><td>—</td><td>—</td></tr>
+<tr><td><code>get_listing</code></td><td>R</td><td>—</td><td>—</td></tr>
+<tr><td><code>check_inventory</code></td><td>R</td><td>—</td><td>—</td></tr>
+<tr><td><code>search_policies</code></td><td>R</td><td>—</td><td>—</td></tr>
+<tr><td><code>apply_markdown</code></td><td>W</td><td>price</td><td>yes (price restored)</td></tr>
+<tr><td><code>adjust_stock</code></td><td>W</td><td>stock</td><td>yes (qty restored)</td></tr>
+<tr><td><code>swap_listing</code></td><td>W</td><td>—</td><td>yes (deactivation reversed)</td></tr>
+<tr><td><code>send_reply</code></td><td>W</td><td>tone, policy, grounding</td><td>no (immutable; can post correction)</td></tr>
+</tbody>
+</table>
+
+<h3>4.1 Eight-branch priority routing tree</h3>
+<p>
+Routing is deterministic, ordered, and visible in the operator's tool trace.
+The first branch that matches owns the reply. This makes it impossible for a
+prompt-injection probe to bypass the gate, impossible for an abuse buyer to
+get a confident product reply, impossible for a comparison query to auto-send.
+</p>
+<pre>0.  prompt-injection probe        (ignore the policy / forget the rules)        → deflect, human
+0b. out-of-domain ask              (do you sell cars / food / vacations)         → admit, human
+1.  abuse / hostility              (scam[a-z]*, cheat[a-z]*, fake garbage…)      → authenticity, human
+2.  policy question                (return / shipping / authenticity / warranty) → search_policies, auto*
+                                   * date-promise probe → human, no commitment
+3.  price negotiation              ($X or Y% off + nego phrase)                  → guardrail-gated markdown
+4a. comparison                     (≥2 brands or "vs"/"versus")                  → focused per-brand search, human
+4b. recommendation                 (best/which/something like/alternative)       → top match, human
+4.  availability / default
+        ↓ low-info pre-screen      (?, "same as before", short anaphora)         → clarify, human
+        ↓ multipath search (Step 1-4 above)
+        ↓ judge:
+              top1 meets ✓ → auto-send
+              alts offered → suggest top1 + alternative, human
+              no match     → "sold out / want me to keep looking?", human</pre>
+
+<h3>4.2 Tool-use loop (real-LLM mode)</h3>
+<ol>
+  <li>System prompt: ground rules + brand tone + auto-send threshold from <code>pricing_rules.json</code>.</li>
+  <li>Up to <strong>4 tool turns</strong>, then circuit-break.</li>
+  <li>Tool results trimmed to ≤4 KB before re-injection (only top hits kept).</li>
+  <li>Retrieval results stash on the orchestrator side and are passed into <code>send_reply</code> as <code>retrieved_context</code> for grounding checks.</li>
+  <li>Final action MUST be a <code>send_reply</code> tool call. Free-form text is coerced into one if the model emits it.</li>
+</ol>
+
+<h3>4.2 Mock-mode fallback</h3>
+<p>
+If <code>ANTHROPIC_API_KEY</code> is unset, the orchestrator runs a deterministic pattern-matched
+stand-in that calls the same tools and emits the same SSE events. Used for offline demos and
+the smoke test. <em>This isn't a substitute for the real model</em> — it's an evaluator harness.
+</p>
+
+<h2 id="guardrails">5. Guardrail stack</h2>
+<p>Every write tool runs through one or more guardrail layers. Each layer returns a verdict:</p>
+
+<table>
+<thead><tr><th>Action</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><span class="tag good">allow</span></td><td>Proceed.</td></tr>
+<tr><td><span class="tag warn">warn</span></td><td>Proceed but surface a warning chip in the operator UI.</td></tr>
+<tr><td><span class="tag warn">human</span></td><td>Force operator click. <code>auto=true</code> downgrades to suggested.</td></tr>
+<tr><td><span class="tag bad">block</span></td><td>Refuse the action; record the verdict.</td></tr>
+</tbody>
+</table>
+
+<h3>5.1 PriceGuardrail (deterministic, &lt;1ms)</h3>
+<ul>
+  <li>Looks up per-listing <code>margin_floor_pct</code> + per-category cap from <code>pricing_rules.json</code>.</li>
+  <li>Blocks if proposed <code>new_price &lt; cost × (1 + margin_floor_pct)</code>.</li>
+  <li>Blocks if <code>pct &gt; max_markdown_pct</code> for category or globally.</li>
+  <li>Downgrades to <span class="tag warn">human</span> when <code>pct &gt; auto_send_max_markdown_pct</code> (default 6–10% by category).</li>
+</ul>
+
+<h3>5.2 StockGuardrail (deterministic, &lt;1ms)</h3>
+<ul>
+  <li>Adjustments: blocks <code>new_qty &lt; 0</code>; downgrades to human if <code>|delta| &gt; 100</code>.</li>
+  <li>Claim check: when a reply states "N left", that N must equal the live <code>stock_qty</code>; mismatch is a <em>hard block</em>.</li>
+</ul>
+
+<h3>5.3 PolicyGuardrail (deterministic, ~1ms)</h3>
+<ul>
+  <li>Detects banned-claim patterns ("guaranteed delivery by X", health claims, competitor disparagement) → <span class="tag bad">block</span>.</li>
+  <li>If reply touches a policy topic (returns/shipping/authenticity), reply must include a <code>[policy:NAME]</code> citation matching retrieved policies. Missing citation → <span class="tag warn">human</span>.</li>
+</ul>
+
+<h3>5.4 ToneGuardrail (regex + optional Haiku, 1–80ms)</h3>
+<ul>
+  <li>Profanity / abuse list: <span class="tag bad">block</span>.</li>
+  <li>Banned phrases ("absolutely", "literally", "to be honest"): <span class="tag warn">warn</span>.</li>
+  <li>All-caps run ≥6 chars (excluding hyphenated/numeric tokens like model numbers): <span class="tag warn">warn</span>.</li>
+  <li>If above is clean and key is present, optional Haiku classifier checks for off-brand / disparaging tone. Falls open on API error.</li>
+</ul>
+
+<h3>5.5 GroundingGuardrail (deterministic, ~2ms)</h3>
+<p>The most defensible layer for the brief. Every factual claim in the reply is matched against retrieved context.</p>
+<ul>
+  <li>Each <code>$X.XX</code> in reply must match a retrieved listing's price within $0.50, or fall within a 70%–105% band of one (allows quoting offers).</li>
+  <li>Each "<em>N left/in stock/available</em>" claim must equal a retrieved <code>stock_qty</code>. Mismatch → <span class="tag bad">block</span>.</li>
+  <li>Each <code>[sku-prefix]</code> citation must reference a SKU we actually retrieved.</li>
+  <li>If reply makes any factual claim (price/qty) but no context was retrieved → <span class="tag bad">block</span>.</li>
+</ul>
+
+<h3>5.6 Defense in depth — all guarantees have backups</h3>
+<table>
+<thead><tr><th>Guarantee</th><th>Defenses</th></tr></thead>
+<tbody>
+<tr><td>One live WebSocket per session</td><td>(1) cancellation flag in the React hook prevents StrictMode from opening two; (2) <code>readyState</code> guard on reconnect; (3) 2-second dedup window on incoming <code>buyer_message</code> events as a final safety net.</td></tr>
+<tr><td>No greeting prefix in seller bubble</td><td>(1) mock orchestrator doesn't generate them; (2) system prompt rule 8 tells real LLM not to; (3) frontend <code>cleanForDisplay</code> strips them on render — including partial mid-stream.</td></tr>
+<tr><td>SKU brackets hidden from buyer view</td><td>(1) UI strips <code>[abcdef12]</code> from the seller bubble at display; (2) the underlying citations row keeps them visible to the operator; (3) audit log + grounding guardrail keep full SKU references for verification.</td></tr>
+<tr><td>System works without an API key</td><td>Deterministic mock orchestrator mirrors every routing branch and tool call. CI smoke validates the full pipeline offline.</td></tr>
+<tr><td>Retrieval never silently empty</td><td>(1) Hybrid → BM25-only → keyword-overlap fallback for both listings and policies; (2) topic-targeted query rewriting in the policy branch so the right doc surfaces even without embeddings.</td></tr>
+</tbody>
+</table>
+
+<div class="callout good">
+<strong>Why this matters:</strong> grounding is the only thing standing between the LLM's natural fluency and a confident wrong answer. We measure breach rate as a primary safety metric (target &lt; 0.5% on sampled audit review).
+</div>
+
+<h2 id="audit">6. Audit trail &amp; rollback</h2>
+
+<h3>6.1 Schema</h3>
+<pre>CREATE TABLE audit_log (
+  audit_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                 TEXT NOT NULL,
+  session_id         TEXT,
+  tool_name          TEXT NOT NULL,
+  input_json         TEXT NOT NULL,
+  output_json        TEXT NOT NULL,
+  guardrail_verdict  TEXT,        -- JSON; per-layer actions + reasons
+  reversed           INTEGER DEFAULT 0,
+  reverse_of         INTEGER      -- audit_id of the action this reverses
+);</pre>
+
+<h3>6.2 Rollback paths</h3>
+<table>
+<thead><tr><th>Tool</th><th>Reversal</th></tr></thead>
+<tbody>
+<tr><td><code>apply_markdown</code></td><td>Restore <code>price</code> from <code>input.old_price</code>.</td></tr>
+<tr><td><code>adjust_stock</code></td><td>Restore <code>stock_qty</code> from <code>input.old_qty</code>.</td></tr>
+<tr><td><code>swap_listing</code></td><td>Reactivate <code>from_sku</code> to its <code>old_a_qty</code>.</td></tr>
+<tr><td><code>send_reply</code></td><td>Not directly reversible — operator can post a correction message and the original is annotated <code>superseded_by</code>.</td></tr>
+</tbody>
+</table>
+<p>Every rollback writes a <em>new</em> audit row with <code>reverse_of</code> pointing to the original. The audit log itself is append-only; the original row is marked <code>reversed=1</code> but its bytes are never edited.</p>
+
+<h2 id="latency">7. Latency budget</h2>
+<table>
+<thead><tr><th>Stage</th><th>Budget</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Ingest + parse</td><td>50ms</td><td>WS frame → Python dict</td></tr>
+<tr><td>Hybrid retrieval (parallel)</td><td>250ms</td><td>BM25 in-process; Chroma local; both fire concurrently in production</td></tr>
+<tr><td>Pre-write guardrails</td><td>100ms</td><td>Deterministic layers only; tone-Haiku off the critical path</td></tr>
+<tr><td>Sonnet first-token</td><td>800ms</td><td>System prompt is prompt-cached; tools schema is stable</td></tr>
+<tr><td>Network + render</td><td>200ms</td><td>SSE-style WS push, single-frame React update</td></tr>
+<tr><td><strong>Total p95</strong></td><td><strong>1.4 s</strong></td><td>Headroom <strong>600ms</strong></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>Mock-mode smoke run (no API):</strong> 5 scenarios end-to-end, max first-token 80ms, max total 471ms. The deterministic layers are well under budget; the model call is the dominant variable cost in real mode.
+</div>
+
+<h3>7.1 Optimizations</h3>
+<ul>
+  <li><strong>Prompt cache</strong> on Anthropic system prompt + tool schemas — saves 200–400ms per turn.</li>
+  <li><strong>Warmup</strong> on FastAPI <code>lifespan</code>: BM25 corpus + retriever instantiated before first real request.</li>
+  <li><strong>Parallel tool calls</strong> when the model emits more than one in a single turn.</li>
+  <li><strong>Sonnet → Haiku fallback</strong> if first-token exceeds 1.4s on three consecutive turns (planned, v0.2).</li>
+</ul>
+
+<h2 id="ebay">8. eBay API integration</h2>
+
+<h3>8.1 v0.1 (this prototype)</h3>
+<p>Real eBay catalog data is loaded from <code>ebay-sample-data.csv</code>. No live API calls. Live chat is replayed locally.</p>
+
+<h3>8.2 v0.2 (sandbox + scripted chat)</h3>
+<table>
+<thead><tr><th>Need</th><th>API</th></tr></thead>
+<tbody>
+<tr><td>Catalog refresh</td><td>Browse API <code>getItem</code>, <code>search</code></td></tr>
+<tr><td>Inventory read/write</td><td>Inventory API <code>getOffer</code>, <code>updateOffer</code></td></tr>
+<tr><td>Markdown / promotional pricing</td><td>Marketing API or <code>updateOffer</code> price field</td></tr>
+<tr><td>Order context (optional)</td><td>Fulfillment API <code>getOrders</code></td></tr>
+<tr><td>Authentication</td><td>OAuth2 user token per seller; refresh-token in our key vault</td></tr>
+</tbody>
+</table>
+
+<h3>8.3 v0.3 (eBay Live ingest)</h3>
+<p>
+We don't have public docs for the Live chat firehose; we propose a co-build with eBay providing
+either: (a) a per-stream WebSocket of buyer messages, or (b) an event-bus push onto a per-seller
+queue. Either way, our <code>WS /ws/chat</code> layer becomes a thin adapter over the eBay-side feed.
+</p>
+
+<h3>8.4 Rate limits &amp; retries</h3>
+<ul>
+  <li>Catalog reads cached for 60s in the retriever; misses re-fetch via Browse API.</li>
+  <li>Writes (markdown, inventory) wrapped in idempotent <code>request-id</code>; retried up to 3× with exponential backoff.</li>
+  <li>If a write returns rate-limit, the audit row records <code>output.deferred=true</code> and the operator UI shows a "retry pending" badge.</li>
+</ul>
+
+<h2 id="failure">9. Failure modes &amp; recovery</h2>
+<table>
+<thead><tr><th>Failure</th><th>Detection</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td>Anthropic API down / slow</td><td>SDK timeout</td><td>Mock-mode-style fallback for FAQ replies; richer turns silently degrade to suggested-only.</td></tr>
+<tr><td>Chroma index missing</td><td>Collection lookup fails</td><td>Retriever falls back to BM25-only; policy lookup falls back to keyword overlap. Logged; doesn't block requests.</td></tr>
+<tr><td>SQLite locked under concurrent writes</td><td>OperationalError</td><td>Single-writer queue (planned v0.2); v0.1 is single-process so unlikely.</td></tr>
+<tr><td>Tool-loop infinite</td><td>Hard cap at 4 turns</td><td>Circuit-breaker emits a generic suggested reply and surfaces in audit.</td></tr>
+<tr><td>Guardrail layer raises</td><td>Try/except per layer</td><td>Layer treated as <span class="tag warn">human</span> by default — fail closed, never silently allow.</td></tr>
+<tr><td>WebSocket drops</td><td>Client onclose</td><td>Client auto-reconnects every 1.5s; backend hub prunes dead subs on next broadcast.</td></tr>
+</tbody>
+</table>
+
+<h2 id="limits">10. Known limits &amp; next steps</h2>
+<h3>v0.1 limits</h3>
+<ul>
+  <li>Single-process backend; no horizontal scale story.</li>
+  <li>Tone classifier (Haiku) is opt-in and not yet on the critical path; deterministic layer carries the demo.</li>
+  <li>Mock-mode orchestrator pattern-matches; real product surface depends on the live model call.</li>
+  <li>Stock quantity in the source CSV is boolean — we synthesize quantities. Production would read live inventory.</li>
+  <li>No multi-language support.</li>
+</ul>
+<h3>Next steps (post-pilot)</h3>
+<ul>
+  <li>Wire eBay sandbox APIs in place of CSV loader; switch retriever to read-through Browse API + local cache.</li>
+  <li>Move audit + messages onto Postgres (with the same schema) once we have multi-stream concurrency.</li>
+  <li>Tone-Haiku into critical path with a 200ms timeout circuit-breaker.</li>
+  <li>L3 autonomy: <code>swap_listing</code> as default response when in-stock substitute confidence &gt; 0.85.</li>
+  <li>Multi-stream operator console (one window, N parallel chat lanes).</li>
+</ul>
+
+</div>
+</body>
+</html>

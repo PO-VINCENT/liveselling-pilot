@@ -1,0 +1,46 @@
+{
+  "global": {
+    "max_markdown_pct": 0.2,
+    "auto_send_max_markdown_pct": 0.1,
+    "require_human_above_pct": 0.1
+  },
+  "by_category": {
+    "Smartphones": {
+      "max_markdown_pct": 0.12,
+      "auto_send_max_markdown_pct": 0.06
+    },
+    "Tablets": {
+      "max_markdown_pct": 0.12,
+      "auto_send_max_markdown_pct": 0.06
+    },
+    "Laptops": {
+      "max_markdown_pct": 0.1,
+      "auto_send_max_markdown_pct": 0.05
+    },
+    "Audio": {
+      "max_markdown_pct": 0.18,
+      "auto_send_max_markdown_pct": 0.08
+    },
+    "Wearables": {
+      "max_markdown_pct": 0.18,
+      "auto_send_max_markdown_pct": 0.08
+    },
+    "Gaming": {
+      "max_markdown_pct": 0.1,
+      "auto_send_max_markdown_pct": 0.05
+    },
+    "Cameras": {
+      "max_markdown_pct": 0.15,
+      "auto_send_max_markdown_pct": 0.07
+    },
+    "TVs/Displays": {
+      "max_markdown_pct": 0.1,
+      "auto_send_max_markdown_pct": 0.05
+    },
+    "Accessories": {
+      "max_markdown_pct": 0.25,
+      "auto_send_max_markdown_pct": 0.1
+    }
+  },
+  "notes": "All markdowns must respect the per-listing margin_floor_pct. The lower of (price * (1 - max_markdown_pct)) and (cost * (1 + margin_floor_pct)) is the floor."
+}

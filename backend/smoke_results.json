@@ -1,0 +1,57 @@
+[
+  {
+    "id": "S1_availability",
+    "ok": true,
+    "final_action": "auto",
+    "first_token_ms": 88.3,
+    "total_ms": 304.4,
+    "tool_calls": [
+      "search_catalog"
+    ],
+    "guardrail_reasons": []
+  },
+  {
+    "id": "S2_negotiation",
+    "ok": true,
+    "final_action": "auto",
+    "first_token_ms": 8.7,
+    "total_ms": 138.6,
+    "tool_calls": [
+      "search_catalog",
+      "get_listing",
+      "apply_markdown"
+    ],
+    "guardrail_reasons": []
+  },
+  {
+    "id": "S3_returns_policy",
+    "ok": true,
+    "final_action": "auto",
+    "first_token_ms": 61.8,
+    "total_ms": 473.8,
+    "tool_calls": [
+      "search_policies"
+    ],
+    "guardrail_reasons": []
+  },
+  {
+    "id": "S4_abuse",
+    "ok": true,
+    "final_action": "human",
+    "first_token_ms": 55.5,
+    "total_ms": 224.9,
+    "tool_calls": [],
+    "guardrail_reasons": []
+  },
+  {
+    "id": "S5_oos_substitute",
+    "ok": true,
+    "final_action": "auto",
+    "first_token_ms": 5.6,
+    "total_ms": 226.9,
+    "tool_calls": [
+      "search_catalog"
+    ],
+    "guardrail_reasons": []
+  }
+]
